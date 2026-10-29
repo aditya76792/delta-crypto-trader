@@ -90,6 +90,9 @@ def configure_logging(log_dir: str | Path = "./logs", level: str = "INFO",
     )
     fh.setFormatter(_JsonFormatter())
     root.addHandler(fh)
+    # third-party request logs are noise on the console (one line per HTTP call)
+    for noisy in ("httpx", "httpcore", "websockets"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     if also_stdout:
         sh = logging.StreamHandler(sys.stdout)
         sh.setFormatter(_JsonFormatter())

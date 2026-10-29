@@ -127,7 +127,8 @@ def cmd_backtest(s: Settings, a: argparse.Namespace) -> int:
             params = s.strategy_params.get(name, {}) if name == s.strategy or a.all else {}
             funding: Any = a.funding_rate
             if source == "exchange" and not a.offline:
-                funding = _funding_series(s, sym, bars) or a.funding_rate
+                fs = _funding_series(s, sym, bars)
+                funding = fs if fs is not None else a.funding_rate
             bt = Backtester(build_strategy(name, params), spec, s.risk,
                             s.paper_starting_equity, s.default_leverage,
                             slippage_bps=a.slippage_bps, funding_rate=funding)
@@ -167,8 +168,15 @@ def _funding_series(s: Settings, symbol: str, bars: Any):
         df = candles_to_frame(rows)
         if df.empty:
             return None
-        print(f"  using real funding history for {symbol} ({len(df)} hourly points)")
-        return (df["close"] / 100.0).astype(float).rename("funding").pipe(pd.Series)
+        series = (df["close"] / 100.0).astype(float).rename("funding")
+        med = float(series.abs().median())
+        print(f"  using real funding history for {symbol} ({len(df)} hourly points, "
+              f"median |rate| {med:.5%} per interval)")
+        if med > 0.005:
+            print("  ! funding values look too large for percent-per-interval; check units "
+                  "(docs/LIMITATIONS.md) — falling back to --funding-rate")
+            return None
+        return pd.Series(series)
     except Exception as exc:
         print(f"  ! funding history unavailable ({exc}); using constant --funding-rate")
         return None
