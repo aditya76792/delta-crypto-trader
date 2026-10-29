@@ -27,6 +27,7 @@ from infrastructure.core.logger import get_logger
 from infrastructure.data.market_data import MarketDataStore
 from infrastructure.exchange.instruments import InstrumentRegistry
 from infrastructure.models import Candle, Position
+from infrastructure.workspace import now_iso, path, read_json, write_json
 from layers.planning import build_plan
 from layers.risk.checker import CheckContext, RiskChecker
 from layers.risk.state import RiskState
@@ -54,6 +55,9 @@ class Trader:
         self.checker = RiskChecker(settings.risk, self.costs)
         self.halted = False
         self.halt_reason = ""
+        self.confirm_entries = False          # live: every entry waits for a typed yes
+        self.confirm_timeout_s = 120.0
+        self.pending: dict[str, dict[str, Any]] = {}
         self._bars_held: dict[str, int] = {}
         self.decisions: list[dict[str, Any]] = []
         self.bus.subscribe("POSITION_CLOSED", self._on_position_closed)
@@ -78,13 +82,21 @@ class Trader:
 
     def handle_message(self, msg: dict[str, Any]) -> None:
         mtype = str(msg.get("type", ""))
+        if mtype in ("key-auth", "auth"):
+            if msg.get("success") is False:
+                self.halt(f"websocket auth failed: {msg.get('status')}", flatten=False)
+            return
         if mtype in ("orders", "positions", "v2/user_trades", "user_trades", "margins"):
             self.ex.handle_ws(msg)
             self.bus.process_all()
             return
         closed = self.store.handle(msg)
         sym = str(msg.get("symbol", "")).replace("MARK:", "")
-        if sym and mtype in ("v2/ticker", "l2_orderbook", "mark_price"):
+        sym = sym or str(msg.get("sy", "")).replace("MARK:", "")
+        if not sym and mtype == "ticker" and msg.get("d"):
+            sym = msg["d"][0].get("s", "")
+        if sym and mtype in ("ticker", "v2/ticker", "ob_l2", "l2_orderbook", "mark_price",
+                             "funding_rate", "trades"):
             self.ex.on_market(sym)
         self.bus.process_all()
         for s, candle in closed:
@@ -150,11 +162,27 @@ class Trader:
             self.bus.emit("PLAN_VETOED", {"plan": pr.plan, "vetoes": res.veto_ids})
             log.info("plan_vetoed", symbol=symbol, vetoes=res.veto_ids)
             return
-        self.bus.emit("PLAN_APPROVED", pr.plan)
+        if self.confirm_entries:
+            pid = pr.plan.plan_id[-8:]
+            self.pending[pid] = {"plan": pr.plan, "signal": sig, "created": self.clock()}
+            write_json(path(f"live/pending/{pid}.json"), {
+                "id": pid, "symbol": symbol, "side": pr.plan.side, "contracts": pr.plan.contracts,
+                "entry_ref": pr.plan.entry_price, "stop": pr.plan.stop_loss,
+                "target": pr.plan.take_profit, "leverage": pr.plan.leverage,
+                "expires_in_s": self.confirm_timeout_s, "created_at": now_iso(),
+                "confirm_with": f"python -m main confirm {pid}"})
+            self._record(symbol, "pending_confirm", pid)
+            log.warning("entry_waiting_for_confirmation", id=pid, symbol=symbol,
+                        side=pr.plan.side, contracts=pr.plan.contracts)
+            return
+        self._execute(symbol, pr.plan)
+
+    def _execute(self, symbol: str, plan: Any) -> None:
+        self.bus.emit("PLAN_APPROVED", plan)
         self.rs.note_order()
         try:
-            order = self.ex.execute_plan(pr.plan)
-            self._record(symbol, "order", f"{pr.plan.side} {pr.plan.contracts} state={order.state}")
+            order = self.ex.execute_plan(plan)
+            self._record(symbol, "order", f"{plan.side} {plan.contracts} state={order.state}")
         except Exception as exc:
             self._record(symbol, "error", str(exc))
             log.exception("execute_plan_failed", symbol=symbol, error=str(exc))
@@ -203,44 +231,105 @@ class Trader:
 
     # ── async runtime (live feed) ───────────────────────────────────────────
 
-    async def run(self, ws: Any, live: bool = False, reconcile_every_s: float = 60.0,
+    def poll_candles(self, rest: Any) -> int:
+        """REST fallback that closes finished bars even if the WS candle stream is
+        missing or late (candles are authoritative from /v2/history/candles)."""
+        n = 0
+        now = int(self.clock())
+        for sym in self.s.symbols:
+            try:
+                rows = rest.get_candles(sym, self.s.resolution, now - 3 * self.store.bar_seconds, now)
+            except Exception as exc:
+                log.warning("candle_poll_failed", symbol=sym, error=str(exc))
+                continue
+            for s_, c in self.store.close_from_rest(sym, rows):
+                n += 1
+                self.on_candle_close(s_, c)
+        self.bus.process_all()
+        return n
+
+    async def run(self, ws_public: Any, ws_private: Any = None, rest: Any = None,
+                  live: bool = False, reconcile_every_s: float = 60.0,
                   stop_after_s: float | None = None) -> None:
+        """Public market data (compact channels) + optional private order/position
+        stream. ``rest`` enables the candle-closing fallback poller."""
         res = self.s.resolution
-        ws.subscribe("v2/ticker", self.s.symbols)
-        ws.subscribe("l2_orderbook", self.s.symbols)
-        ws.subscribe(f"candlestick_{res}", self.s.symbols)
-        ws.subscribe("mark_price", [f"MARK:{s}" for s in self.s.symbols])
-        if live:
+        syms = self.s.symbols
+        ws_public.subscribe("ticker", syms)
+        ws_public.subscribe("ob_l2", syms)
+        ws_public.subscribe(f"candlestick_{res}", syms)
+        ws_public.subscribe("mark_price", [f"MARK:{x}" for x in syms])
+        ws_public.subscribe("funding_rate", syms)
+        ws_public.on_message(self.handle_message)
+        runners = [ws_public.run()]
+        if ws_private is not None:
             for ch in ("orders", "positions", "v2/user_trades"):
-                ws.subscribe_private(ch)
+                ws_private.subscribe_private(ch)
+            ws_private.on_message(self.handle_message)
 
             async def _on_reconnect() -> None:
                 await asyncio.to_thread(self.ex.reconcile)
-            ws.on_reconnect(_on_reconnect)
-        ws.on_message(self.handle_message)
-        tasks = [asyncio.create_task(ws.run()),
-                 asyncio.create_task(self._periodic(live, reconcile_every_s))]
+            ws_private.on_reconnect(_on_reconnect)
+            ws_public.on_reconnect(_on_reconnect)
+            runners.append(ws_private.run())
+        tasks = [asyncio.create_task(r) for r in runners]
+        tasks.append(asyncio.create_task(self._periodic(live, reconcile_every_s, rest)))
         try:
             if stop_after_s:
                 await asyncio.sleep(stop_after_s)
             else:
                 await asyncio.gather(*tasks)
         finally:
-            await ws.stop()
+            for w in (ws_public, ws_private):
+                if w is not None:
+                    await w.stop()
             for t in tasks:
                 t.cancel()
             self.ex.save()
 
-    async def _periodic(self, live: bool, reconcile_every_s: float) -> None:
+    async def _periodic(self, live: bool, reconcile_every_s: float, rest: Any = None) -> None:
         last_rec = 0.0
+        last_bar_poll = 0
         while True:
             await asyncio.sleep(5)
             try:
                 self.watchdog()
+                bar = int(self.clock()) // self.store.bar_seconds
+                # a few seconds after each bar boundary, make sure the bar got closed
+                if rest is not None and bar != last_bar_poll and \
+                        int(self.clock()) % self.store.bar_seconds >= 3:
+                    last_bar_poll = bar
+                    await asyncio.to_thread(self.poll_candles, rest)
                 if live and time.time() - last_rec > reconcile_every_s:
                     last_rec = time.time()
                     await asyncio.to_thread(self.ex.reconcile)
+                self.on_tick()
                 self.ex.save()
                 self.bus.process_all()
             except Exception as exc:
                 log.exception("periodic_error", error=str(exc))
+
+    def on_tick(self) -> None:
+        """Per-tick work: live entries that wait for the user's typed yes."""
+        for pid, item in list(self.pending.items()):
+            conf = read_json(path(f"live/confirmed/{pid}.json"))
+            age = self.clock() - item["created"]
+            if conf is None and age <= self.confirm_timeout_s:
+                continue
+            self.pending.pop(pid, None)
+            plan = item["plan"]
+            if conf is None:
+                self._record(plan.symbol, "expired", pid)
+                continue
+            if conf.get("answer") != "yes":
+                self._record(plan.symbol, "declined", pid)
+                continue
+            if self.halted or self.ex.position(plan.symbol).is_open:
+                self._record(plan.symbol, "skip", f"{pid}: halted or already in a position")
+                continue
+            # prices moved while waiting: re-plan and re-check with fresh data before sending
+            self.confirm_entries, saved = False, self.confirm_entries
+            try:
+                self.try_enter(plan.symbol, item["signal"], self.store.bars(plan.symbol).tail(LOOKBACK_BARS))
+            finally:
+                self.confirm_entries = saved

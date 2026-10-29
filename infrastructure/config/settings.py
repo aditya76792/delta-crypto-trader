@@ -21,9 +21,16 @@ REST_URLS = {
     "prod": "https://api.india.delta.exchange",
     "testnet": "https://cdn-ind.testnet.deltaex.org",
 }
+# Official docs (Websocket Feed, checked 2026-10-29): private channels (orders,
+# positions, user trades) on the private endpoint after key-auth; market data on the
+# public endpoint with the compact message format (ticker, ob_l2, trades, candlestick_*).
 WS_URLS = {
     "prod": "wss://socket.india.delta.exchange",
     "testnet": "wss://socket-ind.testnet.deltaex.org",
+}
+WS_PUBLIC_URLS = {
+    "prod": "wss://public-socket.india.delta.exchange",
+    "testnet": "wss://socket-ind-pub.testnet.deltaex.org",
 }
 
 LIVE_CONFIRM_PHRASE = "I_UNDERSTAND_THIS_USES_REAL_MONEY"
@@ -91,7 +98,13 @@ class Settings:
 
     @property
     def ws_url(self) -> str:
+        """Private (authenticated) WebSocket endpoint."""
         return os.getenv("DELTA_WS_URL") or WS_URLS[self.env]
+
+    @property
+    def ws_public_url(self) -> str:
+        """Public market-data WebSocket endpoint (compact message format)."""
+        return os.getenv("DELTA_WS_PUBLIC_URL") or WS_PUBLIC_URLS[self.env]
 
     @property
     def has_credentials(self) -> bool:
@@ -106,7 +119,7 @@ class Settings:
             "env": self.env, "mode": self.mode, "symbols": self.symbols,
             "resolution": self.resolution, "strategy": self.strategy,
             "api_key": (self.api_key[:4] + "…") if self.api_key else "",
-            "rest_url": self.rest_url, "ws_url": self.ws_url,
+            "rest_url": self.rest_url, "ws_url": self.ws_url, "ws_public_url": self.ws_public_url,
         }
 
 

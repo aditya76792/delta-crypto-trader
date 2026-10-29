@@ -46,7 +46,8 @@ class PaperExecutor(BaseExecutor):
                  starting_equity: float = 1000.0, slippage_bps: float = 2.0,
                  costs: CostModel | None = None, state_path: Path | None = None,
                  participation: float = 0.25, funding_hours: tuple[int, ...] = (0, 8, 16),
-                 clock: Callable[[], float] = time.time, bus: EventBus | None = None) -> None:
+                 clock: Callable[[], float] = time.time, bus: EventBus | None = None,
+                 fill_log: Path | None = None) -> None:
         self.registry = registry
         self.store = store
         self.costs = costs or CostModel()
@@ -56,6 +57,7 @@ class PaperExecutor(BaseExecutor):
         self.clock = clock
         self.bus = bus or EventBus.get()
         self.state_path = state_path
+        self.fill_log = fill_log
         self.balance = starting_equity        # realised wallet balance (USD)
         self._positions: dict[str, Position] = {}
         self._orders: dict[str, Order] = {}
@@ -236,6 +238,15 @@ class PaperExecutor(BaseExecutor):
             return
         self.registry.get(o.symbol)
         book = self.store.books.get(o.symbol)
+        # only walk the book if it is at least as fresh as the quote and agrees with it;
+        # a stale book after a fast move would give impossible fills
+        if book is not None:
+            stale = self.store.age(o.symbol, "book") > self.store.age(o.symbol, "ticker") + 1.0
+            ref_bid, ref_ask = t.best_bid or t.last, t.best_ask or t.last
+            off = (book.best_bid and abs(book.best_bid - ref_bid) / ref_bid > 0.002) or \
+                (book.best_ask and abs(book.best_ask - ref_ask) / ref_ask > 0.002)
+            if stale or off:
+                book = None
         bid = t.best_bid or (book.best_bid if book else None) or t.last
         ask = t.best_ask or (book.best_ask if book else None) or t.last
         mark = t.mark or t.last
@@ -302,6 +313,15 @@ class PaperExecutor(BaseExecutor):
         o.updated_at = datetime.now(timezone.utc)
         f = Fill(o.client_order_id, o.symbol, o.side, qty, price, fee, is_maker)
         self._fills.append(f)
+        if self.fill_log is not None:
+            self.fill_log.parent.mkdir(parents=True, exist_ok=True)
+            with self.fill_log.open("a") as fh:
+                fh.write(json.dumps({
+                    "ts": datetime.fromtimestamp(self.clock(), tz=timezone.utc).isoformat(),
+                    "client_order_id": o.client_order_id, "symbol": o.symbol, "side": o.side,
+                    "size": qty, "price": price, "fee": round(fee, 8), "maker": is_maker,
+                    "realised": round(realised, 8), "reduce_only": o.reduce_only,
+                    "plan_id": o.plan_id}) + "\n")
         self.bus.emit("ORDER_FILLED" if o.state == "closed" else "ORDER_PARTIALLY_FILLED", o)
         if not was_open and pos.is_open:
             self.bus.emit("POSITION_OPENED", pos)
@@ -343,6 +363,10 @@ class PaperExecutor(BaseExecutor):
         pay = self.costs.funding_payment(pos.side or "buy", spec.notional(abs(pos.size), mark), rate)
         pos.funding_paid += pay
         self.balance -= pay
+        if self.fill_log is not None:
+            with self.fill_log.open("a") as fh:
+                fh.write(json.dumps({"ts": now.isoformat(), "symbol": symbol, "funding": round(pay, 8),
+                                     "rate": rate}) + "\n")
         self.bus.emit("FUNDING", {"symbol": symbol, "rate": rate, "paid": pay})
         log.info("paper_funding", symbol=symbol, rate=rate, paid=round(pay, 6))
 

@@ -11,6 +11,10 @@ Command-line entry point:  python -m main <command> [options]
   reconcile        compare local vs exchange positions/orders (live credentials)
   kill             engage (or --release) the kill switch; --flatten closes live positions
   status           show risk state and paper account
+
+Road to live: validate · approve-live · revoke-live · confirm ID · doctor (docs/LIVE.md)
+Desk (manual, paper by default): clock · costs · scan · entry · exit · timemachine ·
+  budget · risk · broker · paper-account · alerts · options (docs/CONTRACTS.md)
 """
 
 from __future__ import annotations
@@ -121,9 +125,12 @@ def cmd_backtest(s: Settings, a: argparse.Namespace) -> int:
         spec = reg.get(sym)
         for name in names:
             params = s.strategy_params.get(name, {}) if name == s.strategy or a.all else {}
+            funding: Any = a.funding_rate
+            if source == "exchange" and not a.offline:
+                funding = _funding_series(s, sym, bars) or a.funding_rate
             bt = Backtester(build_strategy(name, params), spec, s.risk,
                             s.paper_starting_equity, s.default_leverage,
-                            slippage_bps=a.slippage_bps, funding_rate=a.funding_rate)
+                            slippage_bps=a.slippage_bps, funding_rate=funding)
             if a.validate:
                 rep = run_validation(bt, bars, sym, s.resolution, s.data_dir / "backtests",
                                      data_source=source)
@@ -142,6 +149,29 @@ def cmd_backtest(s: Settings, a: argparse.Namespace) -> int:
         print("\nNOTE: synthetic data — results demonstrate mechanics only and can never pass "
               "the live gate.")
     return rc if a.strict else 0
+
+
+def _funding_series(s: Settings, symbol: str, bars: Any):
+    """Real historical funding (/v2/history/candles symbol FUNDING:<SYM>, percent)."""
+    import pandas as pd
+
+    from infrastructure.data.market_data import candles_to_frame
+    try:
+        start, end = int(bars.index[0].timestamp()), int(bars.index[-1].timestamp())
+        rows = []
+        cur = start
+        while cur < end:
+            nxt = min(end, cur + 2000 * 3600)
+            rows += _rest(s).get_funding_history(symbol, "1h", cur, nxt) or []
+            cur = nxt
+        df = candles_to_frame(rows)
+        if df.empty:
+            return None
+        print(f"  using real funding history for {symbol} ({len(df)} hourly points)")
+        return (df["close"] / 100.0).astype(float).rename("funding").pipe(pd.Series)
+    except Exception as exc:
+        print(f"  ! funding history unavailable ({exc}); using constant --funding-rate")
+        return None
 
 
 def _paper_stack(s: Settings, reg: Any, clock: Any = None, state: bool = True):
@@ -196,15 +226,22 @@ def cmd_paper(s: Settings, a: argparse.Namespace) -> int:
         reg.get(sym)
         store.seed_candles(sym, fetch_history(_rest(s), sym, s.resolution, a.seed_days))
     tr = Trader(s, reg, store, ex, build_strategy(s.strategy, s.strategy_params.get(s.strategy)), rs)
+    import time as _t
+
+    from layers.automation.live_process import write_paper_report
     print(f"PAPER trading {s.symbols} [{s.strategy} {s.resolution}] on live Delta India data. "
           f"equity={ex.equity():.2f} USD. Ctrl-C to stop.")
-    ws = DeltaWebSocket(s.ws_url)
+    ws = DeltaWebSocket(s.ws_public_url)
+    errors = {"n": 0}
+    EventBus.get().subscribe("SYSTEM_ERROR", lambda e: errors.__setitem__("n", errors["n"] + 1))
+    started, eq0 = _t.time(), ex.equity()
     try:
-        asyncio.run(tr.run(ws, live=False, stop_after_s=a.duration))
+        asyncio.run(tr.run(ws, rest=_rest(s), live=False, stop_after_s=a.duration))
     except KeyboardInterrupt:
         pass
+    rep = write_paper_report(started, errors["n"], ws.reconnects, tr.decisions, eq0, ex.equity())
     print(json.dumps({"equity": round(ex.equity(), 4), "positions":
-                      {k: v.size for k, v in ex.positions().items()}}, indent=2))
+                      {k: v.size for k, v in ex.positions().items()}, "session": rep}, indent=2))
     return 0
 
 
@@ -232,13 +269,80 @@ def cmd_live(s: Settings, a: argparse.Namespace) -> int:
     for sym in s.symbols:
         store.seed_candles(sym, fetch_history(rest, sym, s.resolution, 5))
     tr = Trader(s, reg, store, ex, build_strategy(s.strategy, s.strategy_params.get(s.strategy)), rs)
-    ws = DeltaWebSocket(s.ws_url, s.api_key, s.api_secret)
-    print(f"LIVE trading {s.symbols} with REAL MONEY. Kill switch: `python -m main kill`.")
+    tr.confirm_entries = not a.no_confirm_each   # every entry waits for `confirm ID` by default
+    ws_pub = DeltaWebSocket(s.ws_public_url)
+    ws_priv = DeltaWebSocket(s.ws_url, s.api_key, s.api_secret)
+    print(f"LIVE trading {s.symbols} with REAL MONEY. Each entry waits for "
+          f"`python -m main confirm ID` (typed yes). Kill switch: `python -m main kill`.")
     try:
-        asyncio.run(tr.run(ws, live=True, stop_after_s=a.duration))
+        asyncio.run(tr.run(ws_pub, ws_priv, rest=rest, live=True, stop_after_s=a.duration))
     except KeyboardInterrupt:
         print("stopped; exchange-side brackets keep protecting open positions")
     return 0
+
+
+def cmd_validate(s: Settings, a: argparse.Namespace) -> int:
+    from layers.automation.live_process import run_validation
+    doc = run_validation(write=True)
+    for sc in doc["scenarios"]:
+        print(f"[{'PASS' if sc['passed'] else 'FAIL'}] {sc['name']:<32} "
+              f"{'; '.join(sc.get('violations') or [])}")
+    print("VALIDATION", "PASSED" if doc["passed"] else "FAILED")
+    return 0 if doc["passed"] else 2
+
+
+def cmd_approve_live(s: Settings, a: argparse.Namespace) -> int:
+    from layers.automation.live_process import approve_live
+    try:
+        doc = approve_live(s, min_paper_hours=a.min_paper_hours)
+    except PermissionError as exc:
+        print(str(exc))
+        return 3
+    print(f"live trading approved for these limits at {doc['approved_at']}")
+    return 0
+
+
+def cmd_revoke_live(s: Settings, a: argparse.Namespace) -> int:
+    from layers.automation.live_process import revoke_live
+    print("live approval removed" if revoke_live() else "there was no live approval")
+    return 0
+
+
+def cmd_confirm(s: Settings, a: argparse.Namespace) -> int:
+    """Answer a pending live entry. Must be typed at a terminal."""
+    from infrastructure.workspace import path, read_json, write_json
+    pend = read_json(path(f"live/pending/{a.id}.json"))
+    if not pend:
+        print(f"no pending entry {a.id}")
+        return 1
+    if not sys.stdin.isatty():
+        print("confirm must be typed by you at a terminal")
+        return 3
+    print(json.dumps(pend, indent=2))
+    ans = input(f"Type yes to send {pend['side']} {pend['contracts']} {pend['symbol']} "
+                f"(anything else declines): ").strip().lower()
+    write_json(path(f"live/confirmed/{a.id}.json"), {"answer": "yes" if ans == "yes" else "no",
+                                                     "typed": ans})
+    print("confirmed" if ans == "yes" else "declined")
+    return 0
+
+
+def cmd_doctor(s: Settings, a: argparse.Namespace) -> int:
+    from layers.automation.live_process import approval_status, readiness
+    rc = cmd_check(s, a)
+    ok, problems = readiness(s, a.min_paper_hours)
+    appr, why = approval_status(s)
+    print("✓ ready to approve live" if ok else "• not ready to approve live:\n  - "
+           + "\n  - ".join(problems))
+    print(("✓ " if appr else "• ") + why)
+    try:
+        rest = _rest(s)
+        rest.sync_time()
+        print(f"• clock offset vs exchange: {rest.clock_offset_s:+.2f}s "
+              "(signatures expire after ~5 s)")
+    except Exception:
+        pass
+    return rc
 
 
 def cmd_reconcile(s: Settings, a: argparse.Namespace) -> int:
@@ -320,8 +424,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--seed-days", type=int, default=5)
     sp = sub.add_parser("live")
     sp.add_argument("--confirm-live", action="store_true")
+    sp.add_argument("--no-confirm-each", action="store_true",
+                    help="do NOT ask for a typed yes per entry (not recommended)")
     sp.add_argument("--duration", type=float, default=None)
     sub.add_parser("reconcile")
+    sub.add_parser("validate", help="scripted scenarios through the real engine (live prerequisite)")
+    sp = sub.add_parser("approve-live", help="typed approval of live trading for current limits")
+    sp.add_argument("--min-paper-hours", type=float, default=4.0)
+    sub.add_parser("revoke-live")
+    sp = sub.add_parser("confirm", help="answer a pending live entry")
+    sp.add_argument("id")
+    sp = sub.add_parser("doctor", help="credentials, clock, data, readiness for live")
+    sp.add_argument("--min-paper-hours", type=float, default=4.0)
+    from desk.cli import register as _register_desk
+    _register_desk(sub)
     sp = sub.add_parser("kill")
     sp.add_argument("--release", action="store_true")
     sp.add_argument("--flatten", action="store_true")
@@ -334,6 +450,8 @@ COMMANDS = {
     "instruments": cmd_instruments, "check": cmd_check, "fetch-history": cmd_fetch_history,
     "backtest": cmd_backtest, "replay": cmd_replay, "paper": cmd_paper, "live": cmd_live,
     "reconcile": cmd_reconcile, "kill": cmd_kill, "status": cmd_status,
+    "validate": cmd_validate, "approve-live": cmd_approve_live, "revoke-live": cmd_revoke_live,
+    "confirm": cmd_confirm, "doctor": cmd_doctor,
 }
 
 
@@ -353,7 +471,10 @@ def main(argv: list[str] | None = None) -> int:
         s.mode = "paper"
     configure_logging(s.log_dir, s.log_level, also_stdout=args.cmd in ("paper", "live"))
     EventBus.reset()
-    return COMMANDS[args.cmd](s, args)
+    if args.cmd in COMMANDS:
+        return COMMANDS[args.cmd](s, args)
+    from desk.cli import dispatch
+    return dispatch(s, args)
 
 
 if __name__ == "__main__":

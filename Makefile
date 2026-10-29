@@ -1,12 +1,15 @@
 # Delta Crypto Trader — developer Makefile
 PYTHON ?= python3
-.PHONY: install install-dev test lint instruments check history backtest validate replay paper live kill status
+.PHONY: install install-dev test lint instruments scan validate-live doctor check history backtest validate replay paper live kill status
 
 install:      ; $(PYTHON) -m pip install -e .
 install-dev:  ; $(PYTHON) -m pip install -e ".[dev]"
 test:         ; $(PYTHON) -m pytest
 lint:         ; $(PYTHON) -m ruff check .
 instruments:  ; $(PYTHON) -m main instruments
+scan:         ; $(PYTHON) -m main scan
+validate-live:; $(PYTHON) -m main validate
+doctor:       ; $(PYTHON) -m main doctor
 check:        ; $(PYTHON) -m main check
 history:      ; $(PYTHON) -m main fetch-history --days 90
 backtest:     ; $(PYTHON) -m main backtest --all --days 60

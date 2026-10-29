@@ -198,7 +198,18 @@ class Ticker:
     best_bid: float | None = None
     best_ask: float | None = None
     funding_rate: float | None = None   # fraction per funding interval
-    open_interest: float | None = None
+    open_interest: float | None = None  # contracts
+    next_funding_ts: float | None = None   # unix seconds of the next funding realisation
+    funding_interval_s: int | None = None
+    turnover_usd_24h: float | None = None
+    change_24h_pct: float | None = None
+    high_24h: float | None = None
+    low_24h: float | None = None
+    band_low: float | None = None
+    band_high: float | None = None
+    bid_size: float | None = None
+    ask_size: float | None = None
+    oi_change_usd_6h: float | None = None
     ts: datetime = field(default_factory=utcnow)
 
     @property

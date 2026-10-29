@@ -60,6 +60,7 @@ class LiveExecutor(BaseExecutor):
         self._sent: set[str] = set()
         self._lock = threading.RLock()
         self._balance_cache: tuple[float, float, float] = (0.0, 0.0, 0.0)  # ts, equity, avail
+        self._realised_at_open: dict[str, float] = {}
 
     # ── account ─────────────────────────────────────────────────────────────
 
@@ -71,10 +72,15 @@ class LiveExecutor(BaseExecutor):
         for r in rows:
             sym = r.get("asset_symbol") or (r.get("asset") or {}).get("symbol")
             if sym == self.settle_asset:
-                eq = float(r.get("balance") or 0) + float(r.get("unrealized_pnl") or 0) \
-                    if r.get("unrealized_pnl") is not None else float(r.get("balance") or 0)
+                eq = float(r.get("balance") or 0)
                 av = float(r.get("available_balance") or 0)
                 break
+        meta = getattr(self.rest, "last_meta", None) or {}
+        if meta.get("net_equity") not in (None, ""):
+            try:   # wallet meta.net_equity includes unrealised PnL (docs: GET /wallet/balances)
+                eq = float(meta["net_equity"])
+            except (TypeError, ValueError):
+                pass
         self._balance_cache = (time.time(), eq, av)
         return eq, av
 
@@ -274,7 +280,8 @@ class LiveExecutor(BaseExecutor):
     def _apply_order_update(o: Order, r: dict[str, Any] | None) -> None:
         if not r:
             return
-        o.exchange_id = str(r.get("id", o.exchange_id or "")) or o.exchange_id
+        oid = r.get("id", r.get("order_id"))      # REST uses "id", WS orders use "order_id"
+        o.exchange_id = str(oid) if oid not in (None, "") else o.exchange_id
         size = int(float(r.get("size", o.size) or o.size))
         unfilled = int(float(r.get("unfilled_size", size) or 0))
         o.size = size
@@ -290,14 +297,32 @@ class LiveExecutor(BaseExecutor):
         o.updated_at = datetime.now(timezone.utc)
 
     def handle_ws(self, msg: dict[str, Any]) -> None:
+        """Private channels (docs, checked 2026-10-29): ``orders`` updates carry
+        order_id, client_order_id, symbol, size, unfilled_size, state, reason; a
+        subscription first sends {"action":"snapshot","result":[...]}. ``positions``
+        updates carry symbol, size (signed), entry_price, liquidation_price, margin.
+        ``v2/user_trades`` reports fills (reason normal / adl / liquidation)."""
         t = msg.get("type")
+        if msg.get("action") == "snapshot" and isinstance(msg.get("result"), list):
+            for row in msg["result"]:
+                self.handle_ws({**row, "type": t, "symbol": row.get("product_symbol")
+                                or row.get("symbol") or msg.get("symbol")})
+            return
+        if t in ("v2/user_trades", "user_trades"):
+            reason = msg.get("reason")
+            if reason in ("adl", "liquidation"):
+                log.critical("exchange_forced_fill", reason=reason, symbol=msg.get("symbol"),
+                             size=msg.get("size"), price=msg.get("price"))
+                self.bus.emit("SYSTEM_ERROR", {"issue": f"exchange_{reason}", "msg": msg})
+            return
         if t == "orders":
             coid = msg.get("client_order_id") or ""
             o = self._orders.get(coid)
             if o is None:
                 if not coid:
                     return
-                o = Order(coid, msg.get("product_symbol", ""), msg.get("side", "buy"),
+                o = Order(coid, msg.get("symbol") or msg.get("product_symbol", ""),
+                          msg.get("side", "buy"),
                           int(float(msg.get("size", 0) or 0)),
                           msg.get("order_type", "limit_order"),
                           reduce_only=bool(msg.get("reduce_only")))
@@ -317,16 +342,25 @@ class LiveExecutor(BaseExecutor):
     def _update_position(self, sym: str, r: dict[str, Any]) -> None:
         pos = self._positions.setdefault(sym, Position(sym, mode="live"))
         was_open = pos.is_open
+        prev_size = pos.size
         pos.size = int(float(r.get("size", 0) or 0))
+        if prev_size and pos.size and (prev_size > 0) != (pos.size > 0):
+            # exits must never flip a position (bracket race / manual trade) → flatten + alert
+            log.critical("position_flipped", symbol=sym, before=prev_size, after=pos.size)
+            self.bus.emit("SYSTEM_ERROR", {"issue": "position_flipped", "symbol": sym})
         pos.entry_price = float(r.get("entry_price") or 0)
         if r.get("liquidation_price"):
             pos.exchange_liq_price = float(r["liquidation_price"])
+        realised_before = self._realised_at_open.get(sym)
         if r.get("realized_pnl") is not None:
             pos.realised_pnl = float(r["realized_pnl"])
         if not was_open and pos.is_open:
+            self._realised_at_open[sym] = pos.realised_pnl
             self.bus.emit("POSITION_OPENED", pos)
         if was_open and not pos.is_open:
-            self.bus.emit("POSITION_CLOSED", {"symbol": sym, "realised": pos.realised_pnl})
+            trade_pnl = pos.realised_pnl - (realised_before or 0.0) \
+                if r.get("realized_pnl") is not None else 0.0
+            self.bus.emit("POSITION_CLOSED", {"symbol": sym, "realised": trade_pnl})
 
     def reconcile(self) -> list[dict[str, Any]]:
         """Exchange is the source of truth. Returns discrepancies found (and fixed)."""

@@ -1,0 +1,22 @@
+{
+  "name": "delta-crypto-trader",
+  "description": "Crypto trading desk for Delta Exchange India: scanner, entry timer, exit planner, Monte-Carlo time machine, budget, risk check, broker with explicit yes and a paper exchange, alerts, option-chain analytics, and a real-time engine (paper first, live only after typed approval).",
+  "version": "0.2.0",
+  "author": {
+    "name": "aditya76792",
+    "url": "https://github.com/aditya76792/delta-crypto-trader"
+  },
+  "homepage": "https://github.com/aditya76792/delta-crypto-trader",
+  "repository": "https://github.com/aditya76792/delta-crypto-trader",
+  "keywords": [
+    "claude-skills",
+    "crypto",
+    "delta-exchange",
+    "india",
+    "perpetual-futures",
+    "paper-trading",
+    "backtesting",
+    "risk-management"
+  ],
+  "skills": "./skills/"
+}

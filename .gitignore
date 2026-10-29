@@ -6,10 +6,11 @@
 *.pem
 *.key
 
-# Runtime data / state
-data/
-logs/
-backups/
+# Runtime data / state (desk workspace, engine state, logs)
+/data/
+/logs/
+/backups/
+/trader/
 
 # Python
 __pycache__/

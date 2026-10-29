@@ -1,0 +1,32 @@
+{
+  "paper": true,
+  "resolution": "5m",
+  "max_loss_per_trade_usd": 10.0,
+  "risk_per_trade_pct": null,
+  "max_daily_loss_usd": 30.0,
+  "max_trades_per_day": 10,
+  "max_orders_per_day": 30,
+  "default_leverage": 5,
+  "max_leverage": 10,
+  "max_open_positions": 3,
+  "max_symbol_exposure_x": 2.0,
+  "max_total_exposure_x": 3.0,
+  "min_reward_risk": 1.5,
+  "require_stop": true,
+  "allow_short": true,
+  "allow_options": false,
+  "allowed_symbols": [],
+  "blocked": [],
+  "min_turnover_usd_24h": 5000000,
+  "max_spread_pct": 0.0015,
+  "max_abs_funding_rate": 0.001,
+  "max_hold_hours": 8,
+  "slippage_bps": 3,
+  "stale_quote_seconds": 30,
+  "funding_hours_utc": [
+    0,
+    8,
+    16
+  ],
+  "paper_starting_equity_usd": 1000.0
+}

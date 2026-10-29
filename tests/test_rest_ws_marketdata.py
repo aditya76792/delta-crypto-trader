@@ -114,7 +114,7 @@ def test_ip_not_whitelisted_is_auth_error():
 def test_ws_auth_and_subscribe_messages():
     ws = DeltaWebSocket("wss://x", "key", "sec")
     m = ws.auth_message(ts=1700000000)
-    assert m["type"] == "auth"
+    assert m["type"] == "key-auth" and m["payload"]["timestamp"] == 1700000000
     assert m["payload"]["signature"] == sign("sec", "GET", "1700000000", "/live")
     ws.subscribe("v2/ticker", ["BTCUSD"])
     ws.subscribe_private("orders")
@@ -158,7 +158,7 @@ async def test_ws_reconnects_resubscribes_and_dispatches():
         opened.append(c)
         return c
 
-    ws = DeltaWebSocket("wss://x", connect=connect, max_backoff_s=0.01)
+    ws = DeltaWebSocket("wss://x", connect=connect, max_backoff_s=0.01, min_backoff_s=0.0)
     ws.subscribe("v2/ticker", ["BTCUSD"])
     got, reconnects = [], []
     ws.on_message(lambda m: got.append(m["symbol"]))

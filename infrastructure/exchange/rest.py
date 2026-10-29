@@ -121,6 +121,7 @@ class DeltaRestClient:
         self._limiter = _WeightLimiter()
         self._http = httpx.Client(base_url=self.base_url, timeout=timeout, transport=transport)
         self.clock_offset_s = 0.0   # server - local, set by sync_time()
+        self.last_meta: dict[str, Any] = {}
 
     # ── low level ───────────────────────────────────────────────────────────
 
@@ -174,6 +175,7 @@ class DeltaRestClient:
 
             data = self._decode(resp)
             if resp.status_code < 400 and data.get("success", True):
+                self.last_meta = data.get("meta") or {}
                 return data.get("result", data)
 
             code, ctx = self._error_code(data, resp)
@@ -274,6 +276,7 @@ class DeltaRestClient:
         return self.request("GET", "/v2/wallet/balances", auth=True)
 
     def get_positions(self) -> list[dict[str, Any]]:
+        """All open positions. Docs: may lag up to ~10 s; use get_position() for real time."""
         return self.request("GET", "/v2/positions/margined", auth=True)
 
     def get_position(self, product_id: int) -> dict[str, Any]:
@@ -319,3 +322,28 @@ class DeltaRestClient:
 
     def place_bracket(self, body: dict[str, Any]) -> Any:
         return self.request("POST", "/v2/orders/bracket", body=body, auth=True, idempotent=True)
+
+    # ── derived public series (docs: /history/candles symbol prefixes) ───────
+
+    def get_funding_history(self, symbol: str, resolution: str, start: int, end: int) -> list[dict]:
+        """Historical funding as candles: symbol ``FUNDING:<SYM>`` (values in percent)."""
+        return self.get_candles(f"FUNDING:{symbol}", resolution, start, end)
+
+    def get_mark_candles(self, symbol: str, resolution: str, start: int, end: int) -> list[dict]:
+        return self.get_candles(f"MARK:{symbol}", resolution, start, end)
+
+    def get_oi_history(self, symbol: str, resolution: str, start: int, end: int) -> list[dict]:
+        return self.get_candles(f"OI:{symbol}", resolution, start, end)
+
+    # ── dead man's switch (docs: "Dead Man's Switch (Auto Cancel)") ──────────
+    # POST /v2/heartbeat/create {heartbeat_id, impact, contract_types|product_symbols,
+    # default_ttl, config:[{action:"cancel_orders", unhealthy_count, value}]} and
+    # POST /v2/heartbeat {heartbeat_id, ttl}. Field semantics (ttl units) are not
+    # spelled out in the docs: OFF by default, verify on testnet before enabling.
+
+    def heartbeat_create(self, body: dict[str, Any]) -> Any:
+        return self.request("POST", "/v2/heartbeat/create", body=body, auth=True, idempotent=True)
+
+    def heartbeat_ack(self, heartbeat_id: str, ttl: int) -> Any:
+        return self.request("POST", "/v2/heartbeat", body={"heartbeat_id": heartbeat_id,
+                                                          "ttl": ttl}, auth=True, idempotent=True)

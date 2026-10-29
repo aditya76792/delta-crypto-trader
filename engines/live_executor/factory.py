@@ -11,6 +11,8 @@ Gates (all must pass):
   5. Instrument specs loaded from the API (not cache/fallback)
   6. A passing, recent backtest report for every strategy/symbol (validation gate)
   7. Kill switch not engaged
+  8. LIVE_APPROVAL.json typed by you via `approve-live` (after a passing `validate` and
+     a real-time paper session) whose limits hash matches today's configuration
 """
 
 from __future__ import annotations
@@ -53,6 +55,10 @@ def check_live_gates(settings: Settings, registry: InstrumentRegistry, cli_confi
             errors.append(f"{sym}: {why}")
     if kill_switch_active:
         errors.append("kill switch is engaged (python -m main kill --release)")
+    from layers.automation.live_process import approval_status
+    ok_appr, why_appr = approval_status(settings)
+    if not ok_appr:
+        errors.append(why_appr)
     if errors:
         raise LiveGateError("LIVE TRADING BLOCKED:\n  - " + "\n  - ".join(errors))
 

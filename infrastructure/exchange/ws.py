@@ -4,8 +4,15 @@ Delta Exchange India WebSocket client (asyncio, ``websockets`` library).
 * Public channels: ``v2/ticker``, ``l2_orderbook``, ``all_trades``, ``mark_price``,
   ``candlestick_<res>``, ``funding_rate``.
 * Private channels (after auth): ``orders``, ``positions``, ``v2/user_trades``, ``margins``.
-* Auth message: {"type": "auth", "payload": {"api-key", "signature", "timestamp"}} with
-  signature = HMAC_SHA256(secret, "GET" + timestamp + "/live").
+* Auth message (current method, docs 08.10.25): {"type": "key-auth", "payload":
+  {"api-key", "signature", "timestamp"}} with timestamp an integer (seconds) and
+  signature = HMAC_SHA256(secret, "GET" + timestamp + "/live"). The old "auth" type
+  stopped working after 31-Dec-2025. Success: {"type":"key-auth","success":true}.
+* Public market data lives on a separate endpoint with compact channel names
+  (``ticker``, ``ob_l2``, ``trades``, ``mark_price``, ``funding_rate``,
+  ``candlestick_<res>``); private channels stay on the main endpoint.
+* The server disconnects a socket with no activity within 60 s of connecting and
+  allows 150 connections per IP per 5 minutes — backoff never goes below 2 s.
 * Heartbeat: we send {"type": "enable_heartbeat"}; the server then emits a
   ``heartbeat`` message periodically. Silence longer than ``stale_after_s`` is
   treated as a dead connection and triggers a reconnect.
@@ -36,12 +43,14 @@ Handler = Callable[[dict[str, Any]], Any]
 class DeltaWebSocket:
     def __init__(self, url: str, api_key: str = "", api_secret: str = "",
                  stale_after_s: float = 35.0, max_backoff_s: float = 60.0,
+                 min_backoff_s: float = 2.0,
                  connect: Callable[..., Awaitable[Any]] | None = None) -> None:
         self.url = url
         self._key = api_key
         self._secret = api_secret
         self.stale_after_s = stale_after_s
         self.max_backoff_s = max_backoff_s
+        self.min_backoff_s = min_backoff_s
         self._connect = connect
         self._subs: dict[str, set[str]] = {}
         self._private: set[str] = set()
@@ -76,10 +85,10 @@ class DeltaWebSocket:
     # ── messages ────────────────────────────────────────────────────────────
 
     def auth_message(self, ts: int | None = None) -> dict[str, Any]:
-        ts_s = str(ts or int(time.time()))
-        return {"type": "auth", "payload": {
-            "api-key": self._key, "timestamp": ts_s,
-            "signature": sign(self._secret, "GET", ts_s, "/live")}}
+        ts_i = int(ts or time.time())
+        return {"type": "key-auth", "payload": {
+            "api-key": self._key, "timestamp": ts_i,
+            "signature": sign(self._secret, "GET", str(ts_i), "/live")}}
 
     def subscribe_message(self) -> dict[str, Any]:
         channels = []
@@ -156,7 +165,8 @@ class DeltaWebSocket:
             if self._stop.is_set():
                 break
             attempt += 1
-            delay = min(self.max_backoff_s, (2 ** min(attempt, 6)) * 0.5) * (0.5 + random.random())
+            delay = max(self.min_backoff_s, min(self.max_backoff_s, (2 ** min(attempt, 6)) * 0.5)
+                        * (0.5 + random.random()))
             log.warning("ws_reconnecting", in_s=round(delay, 2), attempt=attempt)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)
@@ -183,10 +193,21 @@ class DeltaWebSocket:
         mtype = msg.get("type")
         if mtype == "heartbeat":
             return
-        if mtype in ("success", "auth") and (msg.get("message") == "Authenticated"
-                                             or msg.get("success") is True):
-            self.authenticated = True
-            log.info("ws_authenticated")
+        if mtype in ("key-auth", "auth", "success"):
+            if msg.get("success") is True or msg.get("message") == "Authenticated":
+                self.authenticated = True
+                log.info("ws_authenticated")
+            else:
+                self.authenticated = False
+                log.critical("ws_auth_failed", status=msg.get("status"),
+                             message=msg.get("message"))
+            for h in self._handlers:
+                await _maybe_await(h(msg))
+            return
+        if mtype == "subscriptions":
+            bad = [c for c in msg.get("channels", []) if c.get("error")]
+            if bad:
+                log.error("ws_subscription_errors", channels=bad)
             return
         if mtype == "error" or msg.get("success") is False:
             log.error("ws_server_error", msg=msg)

@@ -17,7 +17,8 @@ from infrastructure.models import BookLevel, OrderBook, Ticker  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
+def _clean_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRADER_WORKSPACE", str(tmp_path / "trader"))
     for k in ("DELTA_API_KEY", "DELTA_API_SECRET", "DELTA_LIVE_CONFIRM", "TRADING_MODE",
               "DELTA_LIVE_NONINTERACTIVE", "TRADER_SYMBOLS", "DELTA_ENV"):
         monkeypatch.delenv(k, raising=False)
@@ -68,3 +69,4 @@ def put_market(store: MarketDataStore, symbol: str, price: float, spread: float 
     store.books[symbol] = OrderBook(
         symbol, [BookLevel(bid - i * 0.5, depth) for i in range(5)],
         [BookLevel(ask + i * 0.5, depth) for i in range(5)])
+    store._touch(symbol, "book")

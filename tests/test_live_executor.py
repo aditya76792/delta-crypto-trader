@@ -79,8 +79,15 @@ def live_settings(tmp_path, **kw):
     return s
 
 
+def _approve(s):
+    from infrastructure.workspace import write_json
+    from layers.automation.live_process import approval_path, limits_hash
+    write_json(approval_path(), {"limits_hash": limits_hash(s), "approved_at": "test"})
+
+
 def build(tmp_path, api_registry, rest=None, **kw):
     _passing_report(tmp_path / "bt")
+    _approve(live_settings(tmp_path, **kw))
     return build_live_executor(live_settings(tmp_path, **kw), rest or FakeRest(), api_registry,
                                True, tmp_path / "bt", False, prompt=lambda _: "LIVE BTCUSD",
                                interactive=True)
@@ -112,8 +119,22 @@ def test_gate_requires_cli_flag_api_specs_backtest_and_no_kill(tmp_path, registr
         and "kill switch" in msg
 
 
+def test_gate_requires_matching_approval(tmp_path, api_registry):
+    _passing_report(tmp_path / "bt")
+    s = live_settings(tmp_path)
+    with pytest.raises(LiveGateError, match="not approved"):
+        check_live_gates(s, api_registry, True, tmp_path / "bt", False,
+                         prompt=lambda _: "LIVE BTCUSD", interactive=True)
+    _approve(s)
+    s.default_leverage = 7          # any limit change invalidates the approval
+    with pytest.raises(LiveGateError, match="changed since approval"):
+        check_live_gates(s, api_registry, True, tmp_path / "bt", False,
+                         prompt=lambda _: "LIVE BTCUSD", interactive=True)
+
+
 def test_gate_typed_confirmation(tmp_path, api_registry):
     _passing_report(tmp_path / "bt")
+    _approve(live_settings(tmp_path))
     with pytest.raises(LiveGateError, match="did not match"):
         check_live_gates(live_settings(tmp_path), api_registry, True, tmp_path / "bt", False,
                          prompt=lambda _: "yes", interactive=True)
