@@ -60,7 +60,7 @@ Checked against the official API docs ([docs.delta.exchange](https://docs.delta.
 Requires Python ≥ 3.10.
 
 ```bash
-git clone https://github.com/adity76792/delta-crypto-trader.git
+git clone https://github.com/aditya76792/delta-crypto-trader.git
 cd delta-crypto-trader
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
