@@ -1,0 +1,36 @@
+# Delta Crypto Trader — non-secret configuration.
+# Secrets NEVER go here: use environment variables / .env (see .env.example).
+
+env: prod                 # prod | testnet   (overridden by DELTA_ENV)
+mode: paper               # backtest | paper | live (overridden by TRADING_MODE)
+symbols: [BTCUSD, ETHUSD] # Delta India perpetual symbols (run `python -m main instruments`)
+resolution: 5m            # 1m 3m 5m 15m 30m 1h ...
+strategy: ema_trend_scalp # ema_trend_scalp | vwap_reversion | bb_squeeze_breakout | liquidity_sweep
+default_leverage: 5       # capped by risk.max_leverage and the exchange max for the product
+use_bracket_orders: true  # exchange-side SL/TP attached to every live entry
+paper_starting_equity: 1000   # USD
+paper_slippage_bps: 2
+
+strategy_params:
+  ema_trend_scalp: {fast: 9, slow: 21, trend_period: 200, atr_sl_mult: 1.5, rr: 2.0}
+  vwap_reversion: {band_z: 2.2, atr_buffer: 1.0}
+  bb_squeeze_breakout: {min_squeeze_bars: 6, rr: 2.5}
+  liquidity_sweep: {lookback: 36, rr: 2.0}
+
+risk:
+  risk_per_trade_pct: 0.005          # 0.5 % of equity per trade (incl. fees)
+  max_daily_loss_pct: 0.03           # halt + flatten at -3 % on the UTC day
+  max_total_exposure_x: 3.0          # total notional <= 3 × equity
+  max_symbol_exposure_x: 2.0
+  max_leverage: 10
+  max_open_positions: 3
+  min_liq_distance_atr: 3.0
+  min_liq_buffer_pct: 0.5            # stop distance <= 50 % of entry→liquidation distance
+  min_rr: 1.5
+  max_spread_pct: 0.0015
+  max_abs_funding_rate: 0.001        # skip entries paying > 0.1 % per funding interval
+  max_mark_last_divergence_pct: 0.005
+  stale_data_seconds: 15
+  max_consecutive_losses: 5
+  cooldown_minutes_after_loss_streak: 60
+  max_orders_per_minute: 20
